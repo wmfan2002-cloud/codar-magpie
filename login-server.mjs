@@ -161,7 +161,7 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
         const phone = String(body.phone || "").trim();
         const username = String(body.username || st.username || "");
         const flow = String(body.flow || st.flow || "ip_verify");
-        const tempToken = String(body.temp_token || st.tempToken || "");
+        const tempToken = String(st.tempToken || body.temp_token || "");
 
         if (!/^1[3-9]\d{9}$/.test(phone)) return sendJson(res, 400, { error: "手机号格式不正确" });
         if (!username) return sendJson(res, 400, { error: "缺少用户名，请刷新二维码" });
@@ -186,7 +186,11 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
         const d = r.data || {};
         const rotated = String(d.data?.tempToken || d.data?.temp_token || d.tempToken || d.temp_token || "");
         if (rotated) st.tempToken = rotated;
-        if (!r.ok) return sendJson(res, r.status >= 500 ? 502 : 400, { error: d.message || "发送验证码失败" });
+        if (!r.ok) {
+          const detail = [d.message, d.data?.message, d.code ? `code=${d.code}` : "", `http=${r.status}`]
+            .filter(Boolean).join(" · ");
+          return sendJson(res, r.status >= 500 ? 502 : 400, { error: detail || "发送验证码失败" });
+        }
         return sendJson(res, 200, { ok: true, message: d.message || "验证码已发送", temp_token: rotated || tempToken });
       }
 
@@ -211,21 +215,29 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
           { token: useBind ? undefined : tk, timeoutMs: 60_000 },
         );
 
-        let tempToken = String(body.temp_token || st.tempToken || "");
+        // 以服务端记录的最新临时令牌为准（发短信时上游可能轮换过），
+        // 页面带来的 body.temp_token 可能已过期。
+        let tempToken = String(st.tempToken || body.temp_token || "");
         let r = await attempt(tempToken);
 
         // 首次失败时重新轮询二维码换临时令牌再试一次（与面板逻辑一致）
         if (!r.ok) {
           const again = await post("/v1/wechat/login/status", { scene });
-          const fresh = String(again.data?.data?.token || again.data?.data?.tempToken || "");
+          const dd = again.data?.data || {};
+          const fresh = String(dd.token || dd.tempToken || dd.temp_token || "");
           if (fresh && fresh !== tempToken) {
-            tempToken = fresh; st.tempToken = fresh;
+            tempToken = fresh;
+            st.tempToken = fresh;
             r = await attempt(tempToken);
           }
         }
 
         const d = r.data || {};
-        if (!r.ok) return sendJson(res, r.status >= 500 ? 502 : 400, { error: d.message || "验证失败" });
+        if (!r.ok) {
+          const detail = [d.message, d.data?.message, d.code ? `code=${d.code}` : "", `http=${r.status}`]
+            .filter(Boolean).join(" · ");
+          return sendJson(res, r.status >= 500 ? 502 : 400, { error: detail || "验证失败" });
+        }
         const jwt = String(d.data?.token || d.token || "");
         if (!jwt) return sendJson(res, 502, { error: "验证成功但上游未返回 Token" });
 

@@ -235,7 +235,7 @@ export const LOGIN_PAGE = `<!doctype html>
   $("btn-send").addEventListener("click", function () {
     var phone = ($("phone").value || "").trim();
     if (!/^1[3-9]\\d{9}$/.test(phone)) return setStatus("phone-status", "请输入正确的 11 位手机号", "bad");
-    if (!state.capParams) return setStatus("phone-status", "请先完成上方的人机验证", "bad");
+    if (!state.capParams) return setStatus("phone-status", "请先完成下方的人机验证", "bad");
 
     var btn = $("btn-send"); btn.disabled = true;
     setStatus("phone-status", "正在发送…");
