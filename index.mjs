@@ -20,7 +20,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.2.2";
+const CLIENT = "codar-magpie/0.3.0";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -95,6 +95,38 @@ function keyOf(auth) {
 }
 
 const signedInError = (message) => Object.assign(new Error(message), { signIn: "expired" });
+
+/* -------------------------------------------------- 登录页怎么被访问到 */
+
+/** 逗号/空白分隔的字符串 → 数组 */
+function listOf(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  return String(v || "").split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * 登录页监听地址。
+ *   CODAR_LOGIN_BIND=0.0.0.0      监听所有网卡（VPS 上最常见的做法）
+ *   插件选项 {"loginBind":"0.0.0.0"}  同上，但按 magpie 的插件选项配置
+ * 默认 127.0.0.1：只有服务器本机能访问。
+ */
+function loginBindHost(provider) {
+  return String(
+    process.env.CODAR_LOGIN_BIND ||
+    provider?.options?.loginBind ||
+    "127.0.0.1",
+  ).trim();
+}
+
+/**
+ * 额外的对外地址，用于 nginx/隧道反代到登录端口时直接给用户一个可点的链接。
+ *   CODAR_LOGIN_PUBLIC_URL=https://codar.example.com
+ *   插件选项 {"loginPublicUrl":"https://codar.example.com"}
+ * 只会拼成 <地址>/?k=…；反代需把该地址整个转发到插件启动的端口。
+ */
+function loginPublicUrls(provider) {
+  return listOf(process.env.CODAR_LOGIN_PUBLIC_URL || provider?.options?.loginPublicUrl || "");
+}
 
 /* -------------------------------------------------------- 模型（两种形状） */
 
@@ -187,14 +219,28 @@ export const CodarAuthPlugin = async ({ client } = {}) => ({
       {
         type: "oauth",
         label: "微信扫码登录 Codar（含手机验证）",
-        async authorize() {
-          // 起一个本地回环页面：二维码、手机号、阿里云人机验证都在真浏览器里完成。
+        async authorize(_, provider) {
+          // 监听地址：默认回环；VPS 上可用环境变量/插件选项改成 0.0.0.0
+          // 起一个本地页面：二维码、手机号、阿里云人机验证都在真浏览器里完成。
           // 纯扫码能直接拿到 Token；要验手机时由页面引导到第二步。
-          const session = await startLoginSession();
+          const bind = loginBindHost(provider);
+          const session = await startLoginSession({
+            bindHost: bind,
+            publicUrls: loginPublicUrls(provider),
+          });
+          // 对外开放（bind 非回环）时，回环地址对用户没用，把可访问的那个排前面
+          const remote = session.urls.filter((u) => !u.includes("127.0.0.1"));
+          const primary = bind !== "127.0.0.1" && bind !== "::1" && remote.length
+            ? remote[0]
+            : session.url;
+          const extra = session.urls.filter((u) => u !== primary);
           return {
-            url: session.url,
+            url: primary,
             instructions:
-              "浏览器里用微信扫码。若提示需要手机验证（新 IP 或未绑定手机），在同一个页面填手机号、过完人机验证即可。完成后这里自动继续。",
+              "浏览器里用微信扫码。若提示需要手机验证（新 IP 或未绑定手机），在同一个页面填手机号、过完人机验证即可。完成后这里自动继续。" +
+              (extra.length
+                ? `\n\n这个地址打不开时（例如 magpie 跑在 VPS 上），改用下面任意一个：\n${extra.join("\n")}`
+                : ""),
             method: "auto",
             async callback() {
               try {

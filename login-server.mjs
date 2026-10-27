@@ -11,11 +11,11 @@
 //   - 不记日志、不打印 Token；拿到 Token 立即关闭服务（或 10 分钟超时）。
 
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { LOGIN_PAGE } from "./login-page.mjs";
 
 const AUTH = "https://api.kuaipaper.com";
-const CLIENT = "codar-magpie/0.2.2";
+const CLIENT = "codar-magpie/0.3.0";
 
 const QR_OK = new Set(["confirmed", "success", "logged_in"]);
 const QR_IP = new Set(["ip_verify_required", "required_ip_verify", "ip_verify", "require_ip_verify"]);
@@ -37,6 +37,13 @@ async function post(path, body, { token, timeoutMs = 45_000 } = {}) {
   return { ok: res.ok && bizOk, status: res.status, data };
 }
 
+/** 定长比较，防止按字节提前返回泄露 key 前缀。 */
+function sameKey(given, expected) {
+  const a = Buffer.from(String(given || ""));
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 const sendJson = (res, code, body) => {
   const buf = Buffer.from(JSON.stringify(body));
   res.writeHead(code, {
@@ -56,9 +63,22 @@ const readBody = (req) => new Promise((resolve) => {
 
 /**
  * 起一个登录会话。
- * @returns {Promise<{url: string, wait: () => Promise<{token, username}|{cancelled}>, close: () => void}>}
+ *
+ * @param {object} opts
+ * @param {number} [opts.timeoutMs] 会话存活时间，默认 10 分钟
+ * @param {string} [opts.bindHost]  监听地址。默认 127.0.0.1（仅本机）；
+ *                                  在 VPS 上设 0.0.0.0 好从自己的电脑打开。
+ * @param {string[]} [opts.publicUrls] 额外对外的可达地址前缀，例如
+ *                                  ["https://codar.example.com"]（nginx 反代到这个端口）
+ *                                  或 ["http://1.2.3.4:PORT"]。
+ * @returns {Promise<{url: string, urls: string[], port: number,
+ *   wait: () => Promise<{token, username}|{cancelled}>, close: () => void}>}
  */
-export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
+export async function startLoginSession({
+  timeoutMs = 10 * 60 * 1000,
+  bindHost = process.env.CODAR_LOGIN_BIND || "127.0.0.1",
+  publicUrls = [],
+} = {}) {
   const key = randomBytes(24).toString("hex");
   const scenes = new Map(); // scene -> { qrUrl, tempToken, username, flow }
 
@@ -76,7 +96,9 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
   async function handler(req, res) {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
-      if (url.searchParams.get("k") !== key) return sendJson(res, 403, { error: "bad key" });
+      // 只认带 key 的请求。key 是 48 位十六进制，不可猜；
+      // 对外开放时这是唯一凭据，所以比较用等长定长方式，避免时序侧信道。
+      if (!sameKey(url.searchParams.get("k"), key)) return sendJson(res, 403, { error: "bad key" });
 
       /* ---- 页面 ---- */
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
@@ -255,7 +277,7 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
   const server = createServer(handler);
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    server.listen(0, bindHost, resolve);
   });
 
   const { port } = server.address();
@@ -264,8 +286,21 @@ export async function startLoginSession({ timeoutMs = 10 * 60 * 1000 } = {}) {
   }, timeoutMs);
   expiry.unref?.();
 
+  // 回环地址总是可用（服务器本机 curl / 端口转发）；
+  // 非回环监听时再补上对外地址，方便在 VPS 上从自己的电脑直接打开。
+  const urls = [`http://127.0.0.1:${port}/?k=${key}`];
+  if (bindHost !== "127.0.0.1" && bindHost !== "::1") {
+    urls.push(`http://<服务器地址>:${port}/?k=${key}`);
+  }
+  for (const base of publicUrls) {
+    urls.push(`${String(base).replace(/\/+$/, "")}/?k=${key}`);
+  }
+
   return {
-    url: `http://127.0.0.1:${port}/?k=${key}`,
+    url: urls[0],
+    urls,
+    port,
+    bindHost,
     wait: () => result.then((v) => { close(); return v; }),
     close,
   };
