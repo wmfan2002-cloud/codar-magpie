@@ -20,7 +20,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.1.0";
+const CLIENT = "codar-magpie/0.2.1";
 
 
 /** 实测 billing.quota = 0 的免费模型。 */
