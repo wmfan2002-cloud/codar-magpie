@@ -20,7 +20,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.3.0";
+const CLIENT = "codar-magpie/0.4.0";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -110,9 +110,10 @@ function listOf(v) {
  *   插件选项 {"loginBind":"0.0.0.0"}  同上，但按 magpie 的插件选项配置
  * 默认 127.0.0.1：只有服务器本机能访问。
  */
-function loginBindHost(provider) {
+function loginBindHost(options, provider) {
   return String(
     process.env.CODAR_LOGIN_BIND ||
+    options?.loginBind ||
     provider?.options?.loginBind ||
     "127.0.0.1",
   ).trim();
@@ -124,8 +125,28 @@ function loginBindHost(provider) {
  *   插件选项 {"loginPublicUrl":"https://codar.example.com"}
  * 只会拼成 <地址>/?k=…；反代需把该地址整个转发到插件启动的端口。
  */
-function loginPublicUrls(provider) {
-  return listOf(process.env.CODAR_LOGIN_PUBLIC_URL || provider?.options?.loginPublicUrl || "");
+/**
+ * 中转服务的基地址（Codar 网页控制台的公网地址）。
+ *   CODAR_RELAY_URL=https://…        环境变量
+ *   插件选项 {"relayUrl":"https://…"}  magpie 插件选项
+ * 没配置就完全不注册「中转登录」这种方式。
+ */
+function relayUrl(options, provider) {
+  return String(
+    process.env.CODAR_RELAY_URL ||
+    options?.relayUrl ||
+    provider?.options?.relayUrl ||
+    "",
+  ).trim().replace(/\/+$/, "");
+}
+
+function loginPublicUrls(options, provider) {
+  return listOf(
+    process.env.CODAR_LOGIN_PUBLIC_URL ||
+    options?.loginPublicUrl ||
+    provider?.options?.loginPublicUrl ||
+    "",
+  );
 }
 
 /* -------------------------------------------------------- 模型（两种形状） */
@@ -195,7 +216,7 @@ const asIso = (sec) => (sec ? new Date(Number(sec) * 1000).toISOString() : undef
 
 /* ---------------------------------------------------------------- 插件 */
 
-export const CodarAuthPlugin = async ({ client } = {}) => ({
+export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
   // 声明供应商：登录前后都用同一份模型表，用 ??= 不覆盖用户自己的配置
   config: async (cfg) => {
     cfg.provider ??= {};
@@ -223,10 +244,10 @@ export const CodarAuthPlugin = async ({ client } = {}) => ({
           // 监听地址：默认回环；VPS 上可用环境变量/插件选项改成 0.0.0.0
           // 起一个本地页面：二维码、手机号、阿里云人机验证都在真浏览器里完成。
           // 纯扫码能直接拿到 Token；要验手机时由页面引导到第二步。
-          const bind = loginBindHost(provider);
+          const bind = loginBindHost(options, provider);
           const session = await startLoginSession({
             bindHost: bind,
-            publicUrls: loginPublicUrls(provider),
+            publicUrls: loginPublicUrls(options, provider),
           });
           // 对外开放（bind 非回环）时，回环地址对用户没用，把可访问的那个排前面
           const remote = session.urls.filter((u) => !u.includes("127.0.0.1"));
@@ -283,6 +304,66 @@ export const CodarAuthPlugin = async ({ client } = {}) => ({
           const username = me.data?.data?.username || usernameOf(token);
           await ensureFreeModel(token, username, { force: true });
           return { type: "success", key: token, accountId: username || undefined, metadata: { username, source: "token" } };
+        },
+      },
+      // 最低优先级：需要显式配置中转地址；没配也能看到，
+      // 点了会说明怎么配 —— 比「方式凭空消失」好排查。
+      // 适合 magpie 跑在 VPS 上、自己又不想开端口 / 建隧道的情况。
+      {
+        type: "oauth",
+        label: "通过 Codar 网页控制台中转（需先配置 relayUrl）",
+        async authorize(_, provider) {
+          const base = relayUrl(options, provider);
+          if (!base) {
+            throw new Error(
+              "还没有配置中转地址。用 magpie 插件选项设置 relayUrl，例如：\n" +
+              "magpie plugin options codar-magpie '{\"relayUrl\":\"https://your-panel.example.com\"}'\n" +
+              "或设置环境变量 CODAR_RELAY_URL。面板那侧还需要 RELAY_ENABLE=1。",
+            );
+          }
+          const c = await call(`${base}/api/relay/create`, { method: "POST", body: {} });
+          if (!c.ok || !c.data?.id || !c.data?.secret) {
+            throw new Error(`中转服务不可用：${c.data?.error || `HTTP ${c.status}`}`);
+          }
+          const { id, secret } = c.data;
+          // 密钥放 # 片段：不会发到服务器、不落 nginx 日志、不进 Referer
+          const url = `${String(c.data.url).replace(/#.*$/, "")}#secret=${encodeURIComponent(secret)}`;
+          return {
+            url,
+            instructions:
+              "在打开的页面里完成微信扫码；需要手机验证时也在同一页完成。" +
+              "完成后 Token 会直接交给本插件，中转服务器不保存。",
+            method: "auto",
+            async callback() {
+              const deadline = Date.now() + 10 * 60 * 1000;
+              let idle = 0;
+              while (Date.now() < deadline) {
+                await sleep(2000);
+                let r;
+                try {
+                  r = await call(`${base}/api/relay/poll`, { method: "POST", body: { id, secret } });
+                } catch { idle++; if (idle > 5) return { type: "failed", error: "连不上中转服务" }; continue; }
+                idle = 0;
+                const st = r.data?.status;
+                if (st === "confirmed" && r.data?.token) {
+                  const token = String(r.data.token);
+                  const username = r.data.username || usernameOf(token);
+                  await ensureFreeModel(token, username, { force: true });
+                  return {
+                    type: "success",
+                    key: token,
+                    accountId: username || undefined,
+                    metadata: { username, source: "relay" },
+                  };
+                }
+                if (st === "cancelled") return { type: "failed", error: "已取消" };
+                if (r.status === 404 || r.status === 403) {
+                  return { type: "failed", error: r.data?.error || "中转会话已失效" };
+                }
+              }
+              return { type: "failed", error: "中转登录超时（10 分钟）" };
+            },
+          };
         },
       },
     ],

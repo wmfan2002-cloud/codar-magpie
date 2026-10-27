@@ -15,7 +15,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { LOGIN_PAGE } from "./login-page.mjs";
 
 const AUTH = "https://api.kuaipaper.com";
-const CLIENT = "codar-magpie/0.3.0";
+const CLIENT = "codar-magpie/0.4.0";
 
 const QR_OK = new Set(["confirmed", "success", "logged_in"]);
 const QR_IP = new Set(["ip_verify_required", "required_ip_verify", "ip_verify", "require_ip_verify"]);
