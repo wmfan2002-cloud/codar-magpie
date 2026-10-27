@@ -1,4 +1,4 @@
-# opencode-codar-auth
+# codar-magpie
 
 把 **Codar 科搭（SpeedAI）** 接进 magpie / OpenCode：微信扫码登录一次，16 个模型就能被所有 agent 用，
 附带点数余额、每日签到和新用户免费模型领取。
@@ -12,7 +12,7 @@
 magpie plugin add ~/codar-ai-client/magpie-plugin
 
 # 或 npm / git（发布之后）
-magpie plugin add opencode-codar-auth
+magpie plugin add codar-magpie
 magpie plugin add github:<owner>/<repo>
 ```
 
