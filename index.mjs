@@ -20,7 +20,10 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.2.1";
+const CLIENT = "codar-magpie/0.2.2";
+
+/** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
+const CONTEXT_WINDOW = 1_000_000;
 
 
 /** 实测 billing.quota = 0 的免费模型。 */
@@ -28,7 +31,7 @@ const FREE_MODELS = new Set(["auto", "deepseek-v4.1-flash"]);
 
 /**
  * 目录快照，登录前就能选出模型。运行时会被 /v1/codar/models 覆盖。
- *   ctx: 上下文窗口    api: anthropic | chat    reasoning: 是否回传思维链
+ *   ctx: 上下文窗口（统一 1M）    api: anthropic | chat    reasoning: 是否回传思维链
  */
 const MODEL_TABLE = [
   { id: "auto", ctx: 1_000_000, api: "chat", free: true },
@@ -38,9 +41,9 @@ const MODEL_TABLE = [
   { id: "glm-5.2", ctx: 1_000_000, api: "chat", reasoning: true },
   { id: "glm-5.3", ctx: 1_000_000, api: "chat", reasoning: true },
   { id: "glm-5.3-flash", ctx: 1_000_000, api: "chat", reasoning: true },
-  { id: "gpt-5.6-sol", ctx: 128_000, api: "chat" },
-  { id: "gpt-6-sol", ctx: 128_000, api: "chat" },
-  { id: "gpt-6-astra", ctx: 128_000, api: "chat" },
+  { id: "gpt-5.6-sol", ctx: 1_000_000, api: "chat" },
+  { id: "gpt-6-sol", ctx: 1_000_000, api: "chat" },
+  { id: "gpt-6-astra", ctx: 1_000_000, api: "chat" },
   { id: "claude-sonnet-5", ctx: 1_000_000, api: "anthropic", reasoning: true },
   { id: "claude-sonnet-5-kiro", ctx: 1_000_000, api: "anthropic", reasoning: true },
   { id: "claude-opus-5", ctx: 1_000_000, api: "anthropic", reasoning: true },
@@ -117,7 +120,9 @@ function runtimeModel(raw) {
     id,
     name: `${raw.display_name || id}${FREE_MODELS.has(id) ? "（免费）" : ""}`,
     api: { id, url: V1, npm: npmOf(api) },
-    limit: { context: Number(raw.context_window) || 1_000_000, output: 32_000 },
+    // 上下文统一报 1M：目录里 gpt-* 写的是 128000，但按实际可用性不该限制客户端。
+    // 真超了上游会报错，让用户看到原文比这里猜一个更小的数字好。
+    limit: { context: CONTEXT_WINDOW, output: 32_000 },
     capabilities: { reasoning: /^(claude|deepseek|glm)/.test(id), toolcall: true, attachment: false, input: { text: true } },
     ...(FREE_MODELS.has(id) ? { free: true } : {}),
   };

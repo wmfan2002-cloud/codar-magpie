@@ -74,16 +74,21 @@ agent 里用 `<供应商>/<模型>` 指代，例如 `codar/auto`、`codar/claude
 
 ### 模型与协议
 
-目录来自 `GET /v1/codar/models`（登录后每次刷新，取不到就用内置快照）。协议按目录里的
-`protocol` 分流，和官方客户端一致：
+目录来自 `GET /v1/codar/models`（登录后每次刷新，取不到就用内置快照）。模型 id 以目录为准，
+协议按目录里的 `protocol` 字段分流，和官方客户端一致：
 
 | 模型 | API | 备注 |
 |---|---|---|
 | `auto` / `deepseek-v4.1-flash` | Chat Completions | **免费档**（实测 `billing.quota = 0`） |
 | `deepseek-v4-flash` / `deepseek-v4-pro` | Chat Completions | 回传思维链 |
 | `glm-5.2` / `glm-5.3` / `glm-5.3-flash` | Chat Completions | 回传思维链 |
-| `gpt-5.6-sol` / `gpt-6-sol` / `gpt-6-astra` | Chat Completions | 128K 上下文 |
-| `claude-*` 全系列 | Anthropic Messages | 原生协议，带 `anthropic-version` |
+| `gpt-5.6-sol` / `gpt-6-sol` / `gpt-6-astra` | Chat Completions | — |
+| `claude-sonnet-5` / `claude-opus-5` / `claude-opus-5-5`（及各自的 `-kiro` 档） | Anthropic Messages | 原生协议，带 `anthropic-version` |
+
+**上下文窗口统一报 1M。** 目录里 `gpt-5.6-sol` / `gpt-6-sol` / `gpt-6-astra` 写的是
+`context_window: 128000`，但插件不拿它去限制客户端：agent 侧看到的一律是 1,000,000，
+免得客户端提前截断上下文。**真超了上游会直接报错**，让用户看到厂商原话，比这里猜一个
+更小的数字更可靠。
 
 所有模型都声明 `tool_call`，实际工具调用由上游完成。**图片输入不要用**：目录写着支持，
 但实测返回 400，插件里已经统一声明成纯文本。

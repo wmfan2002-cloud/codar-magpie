@@ -49,7 +49,10 @@ assert.match(rm.name, /免费/);
 const rm2 = I.runtimeModel({ id: "claude-opus-5", protocol: "anthropic_messages", context_window: 200_000 });
 assert.equal(rm2.api.npm, "@ai-sdk/anthropic");
 assert.equal(rm2.capabilities.reasoning, true);
-assert.equal(rm2.limit.context, 200_000);
+// 上下文一律 1M：目录里写 200K / 128K 也不采用，超了让上游报错
+assert.equal(rm2.limit.context, 1_000_000);
+const rm3 = I.runtimeModel({ id: "gpt-6-sol", protocol: "openai_chat_completions", context_window: 128_000 });
+assert.equal(rm3.limit.context, 1_000_000);
 
 // 目录里的每个 id 都在静态表里（两边不漂移）
 const ids = new Set(I.MODEL_TABLE.map((m) => m.id));
