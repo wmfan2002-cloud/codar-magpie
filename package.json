@@ -1,0 +1,27 @@
+{
+  "name": "opencode-codar-auth",
+  "version": "0.1.0",
+  "description": "Codar 科搭 (SpeedAI) in OpenCode and magpie: WeChat QR sign-in, its 16 models, daily check-in and the new-user free models (unofficial)",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "codar",
+    "speedai",
+    "kuaipaper",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 4,
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNiIgZmlsbD0iI2ZmYjAyMSIvPjxwYXRoIGQ9Ik03IDloMTB2Mkg3em0wIDRoN3YySDd6IiBmaWxsPSIjMWQxZDFkIi8+PHBhdGggZD0iTTEyIDNhOSA5IDAgMCAwIDAgMTggOSA5IDAgMCAwIDAtMTh6bTAgMmE3IDcgMCAxIDEgMCAxNCA3IDcgMCAwIDEgMC0xNHoiIGZpbGw9IiMxZDFkMWQiLz48L3N2Zz4="
+  }
+}
