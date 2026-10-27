@@ -14,11 +14,14 @@
 // 所以签到与免费模型的状态、进度不放进页面，而是放进 auth.usage 的 windows ——
 // 那是 magpie 会在「供应商」账号卡片、`magpie quota` 和 GET /v1/magpie/quotas 上渲染的信息面。
 
+import { startLoginSession } from "./login-server.mjs";
+
 const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
 const CLIENT = "codar-magpie/0.1.0";
+
 
 /** 实测 billing.quota = 0 的免费模型。 */
 const FREE_MODELS = new Set(["auto", "deepseek-v4.1-flash"]);
@@ -126,57 +129,6 @@ function npmOf(api) {
 
 /* ------------------------------------------------------------ 扫码 / 领取 */
 
-const QR_OK = new Set(["confirmed", "success", "logged_in"]);
-const QR_BAD = new Set(["expired", "cancelled", "canceled", "rejected"]);
-const QR_PHONE = new Set([
-  "ip_verify_required", "required_ip_verify", "ip_verify", "require_ip_verify",
-  "bind_phone_required", "required_bind_phone", "bind_phone", "require_phone_binding",
-]);
-
-/**
- * 生成二维码并等扫码。上游 status 是 15 秒长轮询，所以这里不 sleep，直接连着等。
- * 返回 { token, username } 或抛出可读的错误。
- */
-async function wechatScan({ deadlineMs = 5 * 60 * 1000 } = {}) {
-  const qr = await call(`${AUTH}/v1/wechat/login/qrcode`, { method: "POST", body: {} });
-  const scene = qr.data?.data?.scene;
-  const qrUrl = qr.data?.data?.qr_url;
-  if (!scene || !qrUrl) throw new Error(`二维码生成失败：${qr.data?.message || `HTTP ${qr.status}`}`);
-
-  const deadline = Date.now() + deadlineMs;
-  let unknown = 0;
-  while (Date.now() < deadline) {
-    let st;
-    try {
-      st = await call(`${AUTH}/v1/wechat/login/status`, {
-        method: "POST", body: { scene }, timeoutMs: 40_000,
-      });
-    } catch {
-      await sleep(2000); // 网络抖动，继续等
-      continue;
-    }
-    const d = st.data?.data || {};
-    const status = String(d.status || "").toLowerCase();
-    const mode = String(d.mode || "").toLowerCase();
-
-    if (QR_OK.has(status) && d.token) {
-      return { token: String(d.token), username: d.username ? String(d.username) : usernameOf(d.token) };
-    }
-    if (QR_BAD.has(status)) throw new Error(`扫码未完成（${status}），请重试`);
-    if (QR_PHONE.has(status) || QR_PHONE.has(mode)) {
-      throw new Error("该账号需要手机号验证（新 IP 或未绑手机）。请在 Codar 网页控制台完成这次登录，再用「粘贴 Token」方式添加账号。");
-    }
-    // 场景失效是上游用件内 code 404 表达的，不是 HTTP 404
-    if (!st.ok && Number(st.data?.code) === 404) throw new Error("二维码已失效，请重新登录");
-    if (status === "pending" || status === "waiting" || status === "scanned" || !status) {
-      unknown = 0;
-      continue;
-    }
-    if (++unknown > 5) throw new Error(`扫码状态无法识别：${status}`);
-  }
-  throw new Error("扫码超时（5 分钟），请重试");
-}
-
 /**
  * 读免费模型活动状态，未领取时顺手领一次。
  *
@@ -229,28 +181,32 @@ export const CodarAuthPlugin = async ({ client } = {}) => ({
     methods: [
       {
         type: "oauth",
-        label: "微信扫码登录 Codar",
+        label: "微信扫码登录 Codar（含手机验证）",
         async authorize() {
-          const qr = await call(`${AUTH}/v1/wechat/login/qrcode`, { method: "POST", body: {} });
-          const url = qr.data?.data?.qr_url;
-          const scene = qr.data?.data?.scene;
-          if (!url || !scene) throw new Error(`二维码生成失败：${qr.data?.message || `HTTP ${qr.status}`}`);
+          // 起一个本地回环页面：二维码、手机号、阿里云人机验证都在真浏览器里完成。
+          // 纯扫码能直接拿到 Token；要验手机时由页面引导到第二步。
+          const session = await startLoginSession();
           return {
-            url,
-            instructions: "用微信扫描打开的二维码，手机上点确认。这里会自动继续（5 分钟内有效）。",
+            url: session.url,
+            instructions:
+              "浏览器里用微信扫码。若提示需要手机验证（新 IP 或未绑定手机），在同一个页面填手机号、过完人机验证即可。完成后这里自动继续。",
             method: "auto",
             async callback() {
               try {
-                const { token, username } = await wechatScan();
-                await ensureFreeModel(token, username, { force: true });
+                const r = await session.wait();
+                if (!r || r.cancelled) return { type: "failed", error: r?.reason || "登录已取消" };
+                const username = r.username || usernameOf(r.token);
+                await ensureFreeModel(r.token, username, { force: true });
                 return {
                   type: "success",
-                  key: token,
+                  key: r.token,
                   accountId: username || undefined,
                   metadata: { username, source: "wechat" },
                 };
               } catch (e) {
                 return { type: "failed", error: String(e?.message || e).slice(0, 500) };
+              } finally {
+                session.close();
               }
             },
           };
@@ -455,5 +411,5 @@ export default { id: PROVIDER, server: CodarAuthPlugin };
 export const _internal = {
   PROVIDER, BASE, AUTH, V1, FREE_MODELS, MODEL_TABLE,
   call, jwtPayload, usernameOf, keyOf, configModel, runtimeModel, npmOf,
-  wechatScan, ensureFreeModel, leftOf,
+  ensureFreeModel, leftOf,
 };

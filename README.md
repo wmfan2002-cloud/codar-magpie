@@ -28,12 +28,35 @@ magpie plugin login codar
 
 | 方式 | 说明 |
 |---|---|
-| **微信扫码登录** | 打开二维码页面，微信扫码并确认，插件自动轮询直到拿到 Token（5 分钟有效） |
+| **微信扫码登录（含手机验证）** | 打开一个本地登录页，微信扫码；需要手机验证时在同一个页面完成 |
 | **粘贴 Codar Token** | 已经有 `eyJ…` 开头的 JWT（比如从网页控制台复制的），直接粘贴，插件会先调 `/api/user/self` 校验 |
 
-**关于手机号验证**：Codar 在「新 IP 登录」或「微信账号未绑手机」时会要求短信验证，而那一步必须过阿里云
-人机验证（浏览器里的验证码组件），插件里做不了。遇到这种情况，插件会明确提示：先去 Codar 网页控制台
-完成这一次登录，再用「粘贴 Token」方式加进来。之后正常使用不受影响。
+### 手机验证是怎么做的
+
+Codar 在「新 IP 登录」或「微信账号未绑手机」时会拦下来要短信验证，而发短信前必须先过
+**阿里云验证码 v4**。那是纯浏览器组件（语义点选 / 滑块），插件宿主里没有 DOM，magpie 的插件页面
+又跑在 `connect-src 'none'` 的沙箱里，所以两种环境都做不了。
+
+做法和社区里同样需要浏览器登录的插件一致：**插件在 `127.0.0.1` 上起一个临时页面**，
+magpie 用系统浏览器打开它，用户在里面扫码、填手机号、过验证码。
+
+```
+magpie ──打开──▶ http://127.0.0.1:<随机端口>/?k=<48位随机key>
+                   ├ 第一步 微信扫码          （二维码图片由本机代理，不跨域）
+                   ├ 第二步 手机验证          （手机号 + 阿里云 captcha4 + 短信码）
+                   └ 完成                      → 插件拿到 JWT，交给 magpie 保存
+```
+
+**安全边界**：只 bind `127.0.0.1`（公网不可达）；每个登录流程一个随机 key，不对就 403；
+不写任何日志、不打印 Token；拿到 Token 或 10 分钟超时后立即关闭服务。
+
+页面里的两种验证流程与网页控制台 `web/server.mjs` 完全一致（同一套上游接口、同样的
+`name`/`type` 组合、同样在失败时重轮询换临时令牌）：
+
+| 场景 | 判定 | 发短信 | 提交 |
+|---|---|---|---|
+| 新 IP | `IP_VERIFY_REQUIRED` / `mode=IP_VERIFY` | `POST /v1/verification-code` `{name: <username>, type: "ip_verify"}` | `POST /v1/user/verify_ip`（需临时令牌） |
+| 未绑手机 | `BIND_PHONE_REQUIRED` / `mode=BIND_PHONE` | `POST /v1/verification-code` `{name: "user", type: "bind_phone"}` | `POST /v1/bind-phone`（无需 Bearer） |
 
 Token 是上游签发的 HS256 JWT，**7 天有效**。到期后上游返回 401，magpie 会把账号标成需要重新登录，
 点一下重新扫码即可。
@@ -122,6 +145,8 @@ POST /api/codar/activities/free-model/claim    # 没领就领
 领取状态和到期时间会显示在上面那个「新用户免费模型」窗口里。
 
 ### 为什么没有「领取」按钮
+
+（登录页不受这个限制——它是插件自己起的回环页面，不是 magpie 的插件页面。）
 
 magpie 的插件页面跑在 `sandbox="allow-scripts"` + `connect-src 'none'` 的 iframe 里：
 **发不出任何网络请求**，也拿不到账号 Token（`magpie.read` 只开放 `usage:summary` 和 `providers:list`，
