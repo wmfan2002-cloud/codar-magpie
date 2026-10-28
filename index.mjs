@@ -20,7 +20,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.4.0";
+const CLIENT = "codar-magpie/0.5.0";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -194,21 +194,64 @@ function npmOf(api) {
  * 调用方拿到 null，会把「已领取」误判成「可领取」。失败不抛错——它不该挡住登录。
  */
 const claimAt = new Map(); // username -> 上次尝试领取的时间
-async function ensureFreeModel(token, username, { force = false } = {}) {
-  if (!username) return null;
-  try {
-    const st = await call(`${BASE}/api/codar/activities/free-model`, { token });
-    const d = st.data?.data;
-    if (!st.ok || !d) return null;
-    // 已经领过、或这个账号不在活动范围，不必再打领取接口
-    if (d.status === "claimed" || d.visible === false) return d;
+const freeCache = new Map(); // username -> { at, data }  活动状态短期缓存
+const FREE_CACHE_MS = 60 * 1000;
 
-    const now = Date.now();
-    if (!force && now - (claimAt.get(username) || 0) < 10 * 60 * 1000) return d; // 状态照给，只是不重复领
+/**
+ * 读免费模型活动状态，未领取时顺手领一次。
+ *
+ * 两层节流，都是为了别让「读额度」被这个接口拖慢：
+ *   - 状态缓存 60 秒：magpie 打开面板/命令会连续读好几次，不必次次打上游；
+ *   - 领取动作 10 分钟：重领是幂等的，打多了没意义。
+ * 失败不抛错——它不该挡住登录，也不该让整次额度读取失败。
+ */
+async function ensureFreeModel(token, username, { force = false, timeoutMs = 8_000, cacheMs = FREE_CACHE_MS } = {}) {
+  if (!username) return null;
+  const now = Date.now();
+  if (force) cacheMs = 0;
+  const cached = freeCache.get(username);
+  if (cached && now - cached.at < cacheMs) return cached.data;
+
+  try {
+    const st = await call(`${BASE}/api/codar/activities/free-model`, { token, timeoutMs });
+    const d = st.data?.data;
+    if (!st.ok || !d) return cached?.data ?? null; // 这次没读到，有旧值就用旧值
+    // 已经领过、或这个账号不在活动范围，不必再打领取接口
+    if (d.status === "claimed" || d.visible === false) {
+      freeCache.set(username, { at: now, data: d });
+      return d;
+    }
+    if (now - (claimAt.get(username) || 0) < 10 * 60 * 1000) {
+      freeCache.set(username, { at: now, data: d }); // 状态照给，只是不重复领
+      return d;
+    }
     claimAt.set(username, now);
-    const r = await call(`${BASE}/api/codar/activities/free-model/claim`, { method: "POST", token });
-    return r.data?.data || d;
-  } catch { return null; }
+    const r = await call(`${BASE}/api/codar/activities/free-model/claim`, { method: "POST", token, timeoutMs });
+    const out = r.data?.data || d;
+    freeCache.set(username, { at: now, data: out });
+    return out;
+  } catch {
+    return cached?.data ?? null; // 超时也退回旧值，别让整次读取失败
+  }
+}
+
+const signCache = new Map(); // username -> { at, data }
+
+/** 签到状态，60 秒内复用；上游慢/失败时退回旧值而不是判失败。 */
+async function signStatus(token, username, { timeoutMs = 5_000, cacheMs = 60_000 } = {}) {
+  const now = Date.now();
+  const cached = signCache.get(username);
+  if (cached && now - cached.at < cacheMs) return cached.data;
+  try {
+    const r = await call(`${AUTH}/v1/daily-sign/status`, {
+      method: "POST", body: { username }, token, timeoutMs,
+    });
+    if (!r.ok) return cached?.data ?? null;
+    signCache.set(username, { at: now, data: r });
+    return r;
+  } catch {
+    return cached?.data ?? null;
+  }
 }
 
 const fmtInt = (n) => (Number.isFinite(Number(n)) ? Number(n).toLocaleString("en-US") : "0");
@@ -399,18 +442,27 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
       if (!username) return { error: "Token 无法解析", signIn: "kept", windows: [] };
 
       try {
-        const [bal, free, sign] = await Promise.all([
-          call(`${AUTH}/v1/gettoken`, { method: "POST", body: { username, token: 0 }, token: key, timeoutMs: 30_000 }),
-          ensureFreeModel(key, username).catch(() => null),
-          call(`${AUTH}/v1/daily-sign/status`, { method: "POST", body: { username }, token: key, timeoutMs: 40_000 })
-            .catch(() => null),
+        // 三个上游接口各自独立超时：任何一个卡住都不能拖垮整次读取。
+        // 只用 Promise.all（全成功）会让 magpie 整次判失败、保留旧值，
+        // 表现就是「额度一直不更新」。这里改成 allSettled + 短超时。
+        const [balR, freeR, signR] = await Promise.allSettled([
+          call(`${AUTH}/v1/gettoken`, { method: "POST", body: { username, token: 0 }, token: key, timeoutMs: 8_000 }),
+          ensureFreeModel(key, username, { timeoutMs: 5_000 }),
+          signStatus(key, username, { timeoutMs: 5_000 }),
         ]);
+        const bal = balR.status === "fulfilled" ? balR.value : null;
+        const free = freeR.status === "fulfilled" ? freeR.value : null;
+        const sign = signR.status === "fulfilled" ? signR.value : null;
 
-        if (bal.status === 401 || Number(bal.data?.code) === 401) {
+        if (bal?.status === 401 || Number(bal?.data?.code) === 401) {
           return { error: "登录已过期，请重新扫码", signIn: "expired", windows: [] };
         }
-        if (!bal.ok || typeof bal.data?.token !== "number") {
-          return { error: `读取点数失败：${bal.data?.message || `HTTP ${bal.status}`}`, signIn: "kept", windows: [] };
+        // 余额是必答项：拿不到才算这次读取失败
+        if (!bal || !bal.ok || typeof bal.data?.token !== "number") {
+          return {
+            error: `读取点数失败：${bal?.data?.message || (bal ? `HTTP ${bal.status}` : "上游超时")}`,
+            signIn: "kept", windows: [],
+          };
         }
 
         const b = bal.data;
@@ -421,22 +473,37 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
         // 签到窗口：服务端按 24 小时冷却，retry_after 就是距离下一次可签的秒数。
         // used 恒为 0——签到不是额度，用 100% 会让卡片看起来像「已用尽」。
         const sd = sign?.data?.data;
-        const signed = Boolean(sd?.isSigned);
+        const signed = sd ? Boolean(sd.isSigned) : null;
         const windows = [];
 
-        windows.push({
-          name: signed ? "每日签到：已签" : "每日签到：未签",
-          used: 0,
-          ...(signed && Number(sd.retry_after) ? { resetSecs: Number(sd.retry_after) } : {}),
-          display: signed
-            ? `下次可签 ${leftOf(sd.retry_after)}后`
-            : "运行 `magpie accounts checkin` 立即补签",
-          aside: false,
-        });
+        if (signed === null) {
+          // 签到查询超时：照实说，别凭空猜一个状态
+          windows.push({
+            name: "每日签到", used: 0,
+            display: "这次没读到签到状态（上游慢），稍后刷新再看",
+            aside: false,
+          });
+        } else {
+          windows.push({
+            name: signed ? "每日签到：已签" : "每日签到：未签",
+            used: 0,
+            ...(signed && Number(sd.retry_after) ? { resetSecs: Number(sd.retry_after) } : {}),
+            display: signed
+              ? `下次可签 ${leftOf(sd.retry_after)}后`
+              : "运行 `magpie accounts checkin` 立即补签",
+            aside: false,
+          });
+        }
 
         // 免费模型窗口：领没领、能不能领，都在名字里说清楚，别让人去找按钮
         const models = (free?.model_ids || ["auto", "deepseek-v4.1-flash"]).join(" / ");
-        if (active) {
+        if (!free) {
+          windows.push({
+            name: "免费模型", used: 0,
+            display: "这次没读到活动状态（上游慢），稍后刷新再看",
+            aside: false,
+          });
+        } else if (active) {
           windows.push({
             name: "免费模型：已领取",
             used: 0,
@@ -496,6 +563,7 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
           return { outcome: "done", message: `今天已签到，${leftOf(st.data.data.retry_after)}后可再签` };
         }
         const r = await call(`${AUTH}/v1/daily-sign`, { method: "POST", body: { username }, token: key, timeoutMs: 40_000 });
+        signCache.delete(username); // 状态变了，别让缓存挡住
         if (r.ok && r.data?.code === 200) {
           return { outcome: "claimed", credit: r.data?.data?.token, message: r.data?.message || "签到成功" };
         }

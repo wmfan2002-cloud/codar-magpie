@@ -1,6 +1,6 @@
 {
   "name": "codar-magpie",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Codar 科搭 (SpeedAI) in magpie and OpenCode: WeChat QR sign-in, 16 models over Chat Completions and Anthropic Messages, daily check-in and the new-user free models (unofficial)",
   "type": "module",
   "main": "./index.mjs",
