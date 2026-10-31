@@ -14,6 +14,7 @@
 // 所以签到与免费模型的状态、进度不放进页面，而是放进 auth.usage 的 windows ——
 // 那是 magpie 会在「供应商」账号卡片、`magpie quota` 和 GET /v1/magpie/quotas 上渲染的信息面。
 
+import fs from "node:fs";
 import { startLoginSession } from "./login-server.mjs";
 
 const PROVIDER = "codar";
@@ -260,34 +261,247 @@ const asIso = (sec) => (sec ? new Date(Number(sec) * 1000).toISOString() : undef
 /**
  * Codar 网关会扫描请求体里的 system prompt，命中某些客户端身份句时拒绝登录凭证
  * （403 client_not_supported："This login credential is restricted to Codar"）。
- * 实测是整句精确匹配：单独的 "Claude Code"、"Anthropic"、claude-cli UA 都不触发。
- * 这里在发出前把命中的句子换成中性句，其余字节不动（与人工验证过的本地代理同款）。
- * 覆盖字符串和 UTF-8 字节两种 body——AI SDK 发的都是字符串；非 UTF-8（如 gzip）原样放行。
+ * 实测是整句精确匹配：单独的 "Claude Code"、"Anthropic"、claude-cli UA 都不触发，
+ * Codex / Cline / Roo / Kilo / opencode / Gemini CLI 的身份句也全部放行（2026-10-31 实测）。
+ *
+ * 两层处理：
+ * 1. 结构式替换——所有 harness 的身份句都在 system 文本的**第一句**、以 "You are" 开头
+ *    （OpenAI 形状在 messages 里 role:system 的开头；Anthropic 形状在顶层 system 块开头，
+ *    抓包实证：Pi 的 19968 字符 system、Claude Code 的 system 块，身份句都是首句）。
+ *    首句以 "You are" 开头且含 harness 特征词的，整句换成中性句。不枚举 agent，
+ *    覆盖现在和将来的任意 harness。
+ * 2. 已知句清单（KNOWN_BLOCKED）——历史验证过的整句，全量文本兜底扫描（防止
+ *    身份句出现在 system 中间或 user 消息里）。
+ * 3. 自愈兜底——上游拦了结构式没盖住的形状时，第一次撞上 client_not_supported，
+ *    二分定位被拦片段记进 blockedMemo，之后的请求提前替换。
+ *
+ * 替换恒定：同一片段永远换成同一句 NEUTRAL_IDENTITY，上游每次看到的字节一致，
+ * 前缀缓存不受影响（它从来没见过未替换的版本）。非 UTF-8 请求体（压缩/二进制）不碰。
  */
-const PROMPT_SUBSTITUTIONS = [
-  [
-    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-    "You are an AI assistant working with the user toward their goals.",
-  ],
+const NEUTRAL_IDENTITY = "You are an AI assistant working with the user toward their goals.";
+const KNOWN_BLOCKED = [
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+  "You are an expert coding assistant operating inside pi, a coding agent harness.",
 ];
+// 结构式替换的判定：You are 开头的句 + 同句含 harness 特征词。
+// 特征词取自真实 harness 身份句的用词：agent / harness / assistant / coding / engineer
+// （Claude Code、Pi、Codex、Cline、Roo、Kilo、opencode、Gemini CLI 全部命中；
+// 正常系统指令不会这样开头）。
+const IDENTITY_PATTERN = /^you are\b.{0,300}\b(agent|harness|assistant|coding|engineer)\b/i;
+const blockedMemo = new Set(); // 自愈发现的片段；上限 64，防失控
+const DISCOVERY_BUDGET = 20; // 每次撞墙最多补发的探测请求数
+const DISCOVERY_DEADLINE_MS = 25_000; // 自愈总时长上限：探测超时会在 20s 卡死整条请求
+let discoveryQueue = Promise.resolve(); // 串行化自愈探测，避免并发请求重复打上游
+const rememberBlocked = (piece) => {
+  if (!piece || blockedMemo.has(piece)) return;
+  if (blockedMemo.size >= 64) blockedMemo.delete(blockedMemo.values().next().value);
+  blockedMemo.add(piece);
+};
+
+function scrubText(text) {
+  const pieces = blockedMemo.size ? [...KNOWN_BLOCKED, ...blockedMemo] : KNOWN_BLOCKED;
+  let out = text;
+  if (pieces.some((p) => out.includes(p))) {
+    out = pieces.reduce((s, p) => s.split(p).join(NEUTRAL_IDENTITY), out);
+  }
+  // 结构式：首句是 harness 身份句（You are 开头 + 特征词）→ 整句换掉。
+  // 兜住 KNOWN_BLOCKED 没枚举到的 harness；已替换过的文本以中性句开头，不会二次命中。
+  if (IDENTITY_PATTERN.test(out)) {
+    const firstSentence = splitFirstSentence(out);
+    if (firstSentence && IDENTITY_PATTERN.test(firstSentence)) {
+      out = NEUTRAL_IDENTITY + out.slice(firstSentence.length);
+    }
+  }
+  return out;
+}
+
+/** 返回文本的第一个句子（含结尾标点），按 .!? 后跟空白切分；找不到边界返回 null。 */
+function splitFirstSentence(text) {
+  const m = /^(.{0,400}?[.!?])(\s|$)/s.exec(text);
+  return m ? m[1] : null;
+}
 
 function scrubRequestBody(body) {
+  let text;
+  let wasBytes = false;
   if (typeof body === "string") {
-    if (!PROMPT_SUBSTITUTIONS.some(([bad]) => body.includes(bad))) return body;
-    return PROMPT_SUBSTITUTIONS.reduce((s, [bad, good]) => s.split(bad).join(good), body);
-  }
-  if (body instanceof Uint8Array) {
-    let text;
+    text = body;
+  } else if (body instanceof Uint8Array) {
     try {
       text = new TextDecoder("utf-8", { fatal: true }).decode(body);
     } catch {
       return body; // 不是 UTF-8 文本（压缩包/图片等），不碰
     }
-    if (!PROMPT_SUBSTITUTIONS.some(([bad]) => text.includes(bad))) return body;
-    const fixed = PROMPT_SUBSTITUTIONS.reduce((s, [bad, good]) => s.split(bad).join(good), text);
-    return new TextEncoder().encode(fixed);
+    wasBytes = true;
+  } else {
+    return body;
   }
-  return body;
+  // 第一层：已知句 + 自愈清单，全量扫描（精确整句，误伤概率低）
+  let out = scrubText(text);
+  // 第二层：结构式——只对 system 槽位的首句身份做替换。
+  // user 消息里也可能有以 "You are" 开头的内容，不能全量文本替换。
+  let parsed = null;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    parsed = null;
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    let touched = false;
+    for (const slot of systemTextSlots(parsed)) {
+      const was = slot.get();
+      const now = scrubSystemIdentity(was);
+      if (now !== was) {
+        slot.set(now);
+        touched = true;
+      }
+    }
+    // 重新序列化是确定性的（键序保持插入序），同一输入永远同一输出 → 前缀缓存稳定
+    if (touched) out = JSON.stringify(parsed);
+  }
+  if (wasBytes) return out === text ? body : new TextEncoder().encode(out);
+  return out;
+}
+
+/**
+ * 结构式身份替换：文本以 "You are" 开头时，取前两句（harness 身份句常跨两句，
+ * 如 Codex 的「名字句 + 运行方式句」）；其中任何一句含 harness 特征词，
+ * 就把整个前导句组换成中性句。正常系统指令（"You are working on a Vue project."）
+ * 不含特征词，不会被动。中性句自身也命中特征词（以 You are 开头、含 assistant），
+ * 所以先排除——否则已替换的文本会被再次「替换」并吞掉自己的第二句。
+ */
+function scrubSystemIdentity(text) {
+  if (!/^you are\b/i.test(text)) return text;
+  if (text === NEUTRAL_IDENTITY || text.startsWith(NEUTRAL_IDENTITY)) return text;
+  let consumed = 0;
+  let matched = false;
+  for (let i = 0; i < 2; i++) {
+    const rel = splitFirstSentence(text.slice(consumed));
+    if (!rel) break;
+    if (IDENTITY_PATTERN.test(rel)) matched = true;
+    // 身份句常跨两句（Codex：「名字句」+「运行方式句」），且第二句不再以 You are 开头
+    // 也会跟上（"…You are running…" 是第二句；"operating inside pi" 挂在逗号后是同一句）。
+    // 所以：第二句无论开头是什么都纳入，只要它紧跟 You are 句组。
+    consumed += rel.length;
+    const ws = /^\s+/.exec(text.slice(consumed));
+    if (ws) consumed += ws[0].length;
+    if (i === 0 && matched) continue; // 第一句已命中，仍看第二句是否也属于身份段
+    if (i === 0 && !/^you are\b/i.test(text.slice(consumed))) {
+      // 第二句不是 "You are" 开头：仅当第一句没命中时停——第一句命中则把这句一起换
+      if (!matched) break;
+    }
+  }
+  return matched ? NEUTRAL_IDENTITY + text.slice(consumed) : text;
+}
+
+/** 收集 body 里 prompt 文本的可写槽位。roles 指定看哪些消息角色。 */
+function promptSlots(parsed, roles) {
+  const slots = [];
+  const slot = (get, set) => slots.push({ get, set });
+  const fromBlocks = (arr) => {
+    for (const b of arr ?? [])
+      if (b?.type === "text" && typeof b.text === "string" && b.text)
+        slot(() => b.text, (t) => (b.text = t));
+  };
+  if (roles.includes("system")) {
+    // Anthropic 形状：顶层 system（字符串或文本块数组）
+    if (typeof parsed?.system === "string" && parsed.system) {
+      slot(() => parsed.system, (t) => (parsed.system = t));
+    } else if (Array.isArray(parsed?.system)) {
+      fromBlocks(parsed.system);
+    }
+  }
+  // OpenAI 形状：messages 里的 system / developer；兜底再扫 user
+  for (const m of Array.isArray(parsed?.messages) ? parsed.messages : []) {
+    if (!roles.includes(m?.role)) continue;
+    if (typeof m.content === "string" && m.content) slot(() => m.content, (t) => (m.content = t));
+    else if (Array.isArray(m.content)) fromBlocks(m.content);
+  }
+  return slots;
+}
+
+const systemTextSlots = (parsed) => promptSlots(parsed, ["system", "developer"]);
+const userTextSlots = (parsed) => promptSlots(parsed, ["user"]);
+
+/**
+ * 自愈探测：确认被拦片段在哪一组槽位（先 system，整组换掉能过才算），再在槽位内
+ * 前缀二分到行，最后验证「只留这个候选行仍被拦」——三步都过才把候选记进清单，
+ * 保证记下的片段单凭自己就足以触发拦截（否则重试照样 403）。跨行/超大片段不猜，
+ * 短块整块兜底，长块放弃（403 原样交还，不悄悄毁掉大段 prompt）。
+ * 探测请求 max_tokens 压到 1、读完即取消；探测体先过一遍当前清单（scrubText），
+ * 已知的片段不再干扰判定。预算用完就放弃本次定位。
+ */
+async function discoverBlockedPiece(rawBody, send) {
+  let parsed;
+  try {
+    parsed = JSON.parse(typeof rawBody === "string" ? rawBody : new TextDecoder().decode(rawBody));
+  } catch {
+    return null; // 结构未知，没法二分
+  }
+  let budget = DISCOVERY_BUDGET;
+  const deadline = Date.now() + DISCOVERY_DEADLINE_MS;
+  const probe = async (mutate) => {
+    if (budget <= 0 || Date.now() > deadline) return false;
+    budget -= 1;
+    const clone = structuredClone(parsed);
+    mutate(clone);
+    if (Number.isFinite(clone.max_tokens)) clone.max_tokens = 1;
+    try {
+      const r = await send(scrubText(JSON.stringify(clone)));
+      r.body?.cancel?.();
+      return r.ok;
+    } catch {
+      return false; // 网络/超时中断：按没通过处理
+    }
+  };
+  // 依次检查 system 组、user 组（上游实测只扫 system；user 是兜底）
+  for (const slotsOf of [systemTextSlots, userTextSlots]) {
+    const slots = slotsOf(parsed);
+    if (!slots.length) continue;
+    // 整组换成中性句后放行 → 被拦片段确实在本组；否则换下一组
+    if (!(await probe((c) => slotsOf(c).forEach((s) => s.set(NEUTRAL_IDENTITY))))) continue;
+    // 找出含被拦片段的槽位：其他槽位全换后仍 403 → 本槽位有
+    for (let i = 0; i < slots.length; i++) {
+      if (await probe((c) => slotsOf(c).forEach((s, j) => { if (j !== i) s.set(NEUTRAL_IDENTITY); }))) continue;
+      const lines = slots[i].get().split("\n");
+      // 槽位扫描本身就是「只留整槽」的验证，单行槽位直接采信
+      if (lines.length === 1) return lines[0];
+      // 前缀二分：最小的 k 使「前 k 行换成中性句」后放行 → 被拦的是第 k-1 行
+      let lo = 1, hi = lines.length, found = -1;
+      while (lo <= hi && budget > 0) {
+        const mid = (lo + hi) >> 1;
+        if (
+          await probe((c) => {
+            const ss = slotsOf(c);
+            const ls = ss[i].get().split("\n");
+            ss[i].set([NEUTRAL_IDENTITY, ...ls.slice(mid)].join("\n"));
+          })
+        ) {
+          found = mid - 1;
+          hi = mid - 1;
+        } else {
+          lo = mid + 1;
+        }
+      }
+      if (found < 0) {
+        const whole = slots[i].get();
+        return whole.length <= 400 ? whole : null; // 预算耗尽/多行同时被拦：短块整块兜底
+      }
+      // 验证：其余全换、只把候选行放回去——仍被拦（probe false）才采信（跨行片段会在这里被识破）
+      const candidate = lines[found];
+      if (candidate.length > 400) return null;
+      const alone =
+        candidate.length > 0 &&
+        !(await probe((c) => {
+          const ss = slotsOf(c);
+          ss.forEach((s, j) => { if (j !== i) s.set(NEUTRAL_IDENTITY); });
+          ss[i].set(`${NEUTRAL_IDENTITY}\n${candidate}`);
+        }));
+      return alone ? candidate : slots[i].get().length <= 400 ? slots[i].get() : null;
+    }
+    return null;
+  }
+  return null;
 }
 
 /* ---------------------------------------------------------------- 插件 */
@@ -458,8 +672,47 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
           headers.set("authorization", `Bearer ${key}`);
           if (String(url).includes("/messages")) headers.set("anthropic-version", "2023-06-01");
           headers.delete("content-length"); // 交给 fetch 重算
-          // 请求体过一遍身份句替换，避免上游对 agent 客户端的 prompt 扫描 403
-          return fetch(input, { ...init, headers, body: scrubRequestBody(init?.body) });
+          // 请求体过一遍身份句替换，避免上游对 agent 客户端的 prompt 扫描 403。
+          // 只在 init 带了 body 时才写 body 键——input 是 Request 对象时
+          // 显式 body: undefined 会把 Request 自带的请求体剥掉。
+          const next = { ...init, headers };
+          if (init && init.body !== undefined) next.body = scrubRequestBody(init.body);
+          const res = await fetch(input, next);
+          if (res.status !== 403) return res;
+          const path = String(url);
+          // 自愈只对推理端点做：其他端点的 403（越权等）跟 prompt 扫描无关
+          if (!path.includes("/messages") && !path.includes("/chat/completions")) return res;
+          let rawBody = init?.body;
+          if (rawBody === undefined && input instanceof Request) {
+            try { rawBody = await input.clone().text(); } catch { return res; }
+          }
+          if (typeof rawBody !== "string" && !(rawBody instanceof Uint8Array)) return res;
+          const errText = await res.clone().text().catch(() => "");
+          // 两种错误体都要认：/v1/messages 是 {"detail":{"code":"client_not_supported",…}}，
+          // /v1/chat/completions 是 {"code":null,"type":"permission_error","message":"…restricted to Codar…"}（Pi 实测）
+          if (!errText.includes("client_not_supported") && !errText.includes("restricted to Codar")) return res;
+          // 现场快照（仅调试期）：把被拦的完整请求体落盘，供离线重放定位。
+          // 只写请求体——头里全是凭证，一个字节都不写。上限 5 个文件，防写爆。
+          try {
+            const dir = "/tmp/codar-403";
+            fs.mkdirSync(dir, { recursive: true });
+            const files = fs.readdirSync(dir);
+            if (files.length < 5) {
+              const text = typeof rawBody === "string" ? rawBody : new TextDecoder().decode(rawBody);
+              fs.writeFileSync(
+                `${dir}/${Date.now()}.json`,
+                JSON.stringify({ url: path, at: new Date().toISOString(), errText: errText.slice(0, 400), body: JSON.parse(text) }, null, 1),
+              );
+            }
+          } catch { /* 快照失败不影响主流程 */ }
+          const method = init?.method ?? (input instanceof Request ? input.method : "POST");
+          const send = (body) => fetch(url, { method, headers, body, signal: AbortSignal.timeout(20_000) });
+          const run = discoveryQueue.then(() => discoverBlockedPiece(rawBody, send));
+          discoveryQueue = run.catch(() => {});
+          const piece = await run.catch(() => null);
+          if (!piece) return res;
+          rememberBlocked(piece);
+          return fetch(url, { ...next, method, body: scrubRequestBody(rawBody) });
         },
       };
     },
@@ -645,5 +898,5 @@ export default { id: PROVIDER, server: CodarAuthPlugin };
 export const _internal = {
   PROVIDER, BASE, AUTH, V1, FREE_MODELS, MODEL_TABLE,
   call, jwtPayload, usernameOf, keyOf, configModel, runtimeModel, npmOf,
-  ensureFreeModel, leftOf, scrubRequestBody,
+  ensureFreeModel, leftOf, scrubRequestBody, systemTextSlots, discoverBlockedPiece, blockedMemo,
 };

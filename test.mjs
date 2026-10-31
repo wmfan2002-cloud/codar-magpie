@@ -92,6 +92,43 @@ assert.equal(
   'prefix "You are an AI assistant working with the user toward their goals." suffix',
 );
 
+// 结构式身份替换：harness 身份句在 system 槽位首句（You are 开头 + 特征词）→ 整段换中性句。
+// 覆盖不枚举的 harness；user 消息和普通系统指令不动。
+const NEUTRAL = "You are an AI assistant working with the user toward their goals.";
+const openaiSys = (sys) => JSON.stringify({ messages: [{ role: "system", content: sys }] });
+for (const [label, body] of Object.entries({
+  "Claude Code 句": openaiSys("You are a coding assistant."),
+  "Pi 句": openaiSys("You are an expert coding assistant operating inside pi, a coding agent harness. Rest here."),
+  "Codex 两句式": openaiSys("You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI."),
+  "Cline engineer 式": openaiSys("You are Cline, a highly skilled software engineer with extensive knowledge."),
+  "opencode": openaiSys("You are opencode, an agent that lives in the terminal."),
+  "Gemini": openaiSys("You are Gemini CLI, an interactive CLI agent specializing in software engineering tasks."),
+  "假想新 harness": openaiSys("You are FooBar, a brand new agent harness nobody listed."),
+  "Anthropic system 块": JSON.stringify({ system: [{ type: "text", text: "You are an interactive CLI agent for coding." }, { type: "text", text: "Other." }] }),
+  "developer 角色": openaiSys2(),
+})) {
+  const out = I.scrubRequestBody(body);
+  assert.notEqual(out, body, `${label} 应被结构式替换`);
+  const text = JSON.parse(out).messages?.[0]?.content ?? JSON.parse(out).system?.[0]?.text;
+  assert.ok(text.startsWith(NEUTRAL), `${label} 应以中性句开头`);
+}
+function openaiSys2() {
+  return JSON.stringify({ messages: [{ role: "developer", content: "You are a coding assistant for review." }] });
+}
+// 不该动的：普通系统指令、中文、中间出现的身份句、user 消息
+// （「已替换」要单测：单句的已替换文本经 JSON 重序列化键序不变但字符串会稳定一致，
+//   而带后文的已替换文本不应再触发结构式替换）
+for (const [label, body] of Object.entries({
+  "普通指令": openaiSys("You are working on a Vue project. Use TypeScript."),
+  "普通指令2": openaiSys("You are Codex, based on GPT-5. Answer briefly."),
+  "中文": openaiSys("你是一个编程助手。请帮用户完成任务。"),
+  "中间身份句": openaiSys("Intro.\nYou are an agent harness in the middle."),
+  "user 消息": JSON.stringify({ messages: [{ role: "user", content: "You are an agent harness writer." }] }),
+  "已替换带后文": openaiSys(`${NEUTRAL} More instructions.`),
+})) {
+  assert.equal(I.scrubRequestBody(body), body, `${label} 不应被改动`);
+}
+
 // ensureFreeModel：节流后仍返回状态（不能返回 null，否则列表会误判成「可领取」）
 const origFetch = globalThis.fetch;
 let claimCalls = 0;
