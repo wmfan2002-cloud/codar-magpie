@@ -1,6 +1,6 @@
 # codar-magpie
 
-把 **Codar 科搭（SpeedAI）** 接进 magpie / OpenCode：微信扫码登录一次，16 个模型就能被所有 agent 用，
+把 **Codar 科搭（SpeedAI）** 接进 magpie / OpenCode：微信扫码登录一次，50+ 个模型就能被所有 agent 用，
 附带点数余额、每日签到和新用户免费模型领取。
 
 > 非官方插件。登录用的是 Codar 自己的扫码接口，Token 存在 magpie 的 `plugin-auth.json`（权限 600）。
@@ -186,7 +186,7 @@ Token 是上游签发的 HS256 JWT，**7 天有效**。到期后上游返回 401
 ## 用起来
 
 ```bash
-magpie plugin                    # codar (Codar 科搭, 16 models)  signed in
+magpie plugin                    # codar (Codar 科搭, 50+ models)  signed in
 magpie provider test codar auto  # 发一个最小请求验证链路
 magpie quota                     # 点数余额 + 免费期
 magpie models                    # agent 能选的模型
@@ -196,8 +196,14 @@ agent 里用 `<供应商>/<模型>` 指代，例如 `codar/auto`、`codar/claude
 
 ### 模型与协议
 
-目录来自 `GET /v1/codar/models`（登录后每次刷新，取不到就用内置快照）。模型 id 以目录为准，
-协议按目录里的 `protocol` 字段分流，和官方客户端一致：
+模型列表来自两份上游目录（登录后每次刷新，取不到就用内置快照）：
+
+- `GET /v1/codar/models`：官方精选目录（16 个），带协议、定价和请求 schema，优先使用
+- `GET /v1/models`：上游全量清单（61 个），用来补齐精选目录没列的对话模型；
+  画图 / 向量 / 音频类（`*-image*`、`nano-banana`、`embedding` 等）会被排除
+
+合并后约 52 个。精选目录里的模型按 `protocol` 字段分流；补充进来的 `claude-*` 走
+Anthropic Messages，其余走 OpenAI 兼容的 Chat Completions。常用模型：
 
 | 模型 | API | 备注 |
 |---|---|---|

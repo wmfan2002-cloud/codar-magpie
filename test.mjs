@@ -59,6 +59,20 @@ const ids = new Set(I.MODEL_TABLE.map((m) => m.id));
 assert.equal(ids.size, 16);
 for (const id of ["auto", "claude-opus-5-5", "glm-5.3-flash", "gpt-6-sol"]) assert.ok(ids.has(id), id);
 
+// 全量清单合并：精选目录优先，补上它没列的对话模型，排除画图/向量模型
+assert.equal(I.isNonChatModel("gpt-image-2"), true);
+assert.equal(I.isNonChatModel("gemini-nano-banana-2.1"), true);
+assert.equal(I.isNonChatModel("text-embedding-3"), true);
+assert.equal(I.isNonChatModel("auto-vision"), false);
+assert.equal(I.isNonChatModel("claude-fable-5-1"), false);
+const merged = I.mergeCatalogs(
+  [{ id: "auto", protocol: "openai_chat_completions" }],
+  ["auto", "kimi-k3", "gpt-image-2", "kimi-k3", "claude-fable-5-1", ""],
+);
+assert.deepEqual(merged.map((m) => m.id), ["auto", "kimi-k3", "claude-fable-5-1"]);
+assert.equal(I.runtimeModel(I.inferredEntry("claude-fable-5-1")).api.npm, "@ai-sdk/anthropic");
+assert.equal(I.runtimeModel(I.inferredEntry("kimi-k3")).api.npm, "@ai-sdk/openai-compatible");
+
 // 时长格式
 assert.equal(I.leftOf(3600), "1 小时 0 分");
 assert.equal(I.leftOf(90), "1 分钟");

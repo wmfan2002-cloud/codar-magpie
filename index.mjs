@@ -21,7 +21,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.5.1";
+const CLIENT = "codar-magpie/0.5.2";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -163,6 +163,47 @@ function configModel(m) {
     ...(m.free ? { free: true } : {}),
     provider: { npm: npmOf(m.api), api: V1 },
   };
+}
+
+/**
+ * 画图 / 向量 / 音频等非对话模型。它们会出现在上游的 /v1/models 里，
+ * 但没有 agent 需要的 chat + tools 契约，不能放进模型选择器。
+ */
+const NON_CHAT_MODEL = /(^|[-_.])(image|embed|embedding|rerank|whisper|tts|audio|video|moderation|nano-banana)([-_.]|$)/i;
+
+function isNonChatModel(id) {
+  return NON_CHAT_MODEL.test(String(id));
+}
+
+/**
+ * /v1/models 有、/v1/codar/models 没有的模型：目录没给协议，只能按 id 推断。
+ * claude-* 走 /v1/messages，其余走上游的 OpenAI 兼容 /v1/chat/completions。
+ */
+function inferredEntry(id) {
+  return {
+    id,
+    display_name: id,
+    protocol: { type: /^claude/i.test(id) ? "anthropic_messages" : "openai_chat_completions" },
+    context_window: CONTEXT_WINDOW,
+  };
+}
+
+/**
+ * 合并两份目录：
+ *   curated — /v1/codar/models，带协议 / 定价 / schema，优先
+ *   raw     — /v1/models，OpenAI 风格的全量清单，只补 curated 没有的对话模型
+ */
+function mergeCatalogs(curated, rawIds) {
+  const have = new Set(curated.map((m) => String(m.id)));
+  const extras = [];
+  const seen = new Set();
+  for (const raw of rawIds) {
+    const id = String(raw ?? "");
+    if (!id || have.has(id) || seen.has(id) || isNonChatModel(id)) continue;
+    seen.add(id);
+    extras.push(inferredEntry(id));
+  }
+  return [...curated, ...extras];
 }
 
 /** provider.models 钩子里的模型：完整的 OpenCode Model。 */
@@ -869,16 +910,23 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
     async models(provider, { auth } = {}) {
       const key = keyOf(auth);
       if (!key) return provider?.models ?? {};
-      let cat;
-      try {
-        cat = await call(`${BASE}/v1/codar/models`, { token: key, timeoutMs: 15_000 });
-      } catch {
-        return provider?.models ?? {};
+      // 精选目录给协议 / 定价；全量清单补上它没列的对话模型。两份并发读，
+      // 任何一份失败都不影响另一份（精选目录失败时仍能显示全量列表）。
+      const [catR, rawR] = await Promise.allSettled([
+        call(`${BASE}/v1/codar/models`, { token: key, timeoutMs: 15_000 }),
+        call(`${BASE}/v1/models`, { token: key, timeoutMs: 15_000 }),
+      ]);
+      const cat = catR.status === "fulfilled" ? catR.value : null;
+      const raw = rawR.status === "fulfilled" ? rawR.value : null;
+      if (cat?.status === 401 || Number(cat?.data?.code) === 401 ||
+          raw?.status === 401 || Number(raw?.data?.code) === 401) {
+        throw signedInError("Codar 登录已过期，请重新扫码");
       }
-      if (cat.status === 401 || Number(cat.data?.code) === 401) throw signedInError("Codar 登录已过期，请重新扫码");
-      const list = Array.isArray(cat.data?.data) ? cat.data.data : null;
-      if (!list?.length) return provider?.models ?? {};
-      return Object.fromEntries(list.filter((m) => m?.id).map((m) => [String(m.id), runtimeModel(m)]));
+      const curated = (Array.isArray(cat?.data?.data) ? cat.data.data : []).filter((m) => m?.id);
+      const rawIds = (Array.isArray(raw?.data?.data) ? raw.data.data : []).map((m) => m?.id);
+      const list = mergeCatalogs(curated, rawIds);
+      if (!list.length) return provider?.models ?? {};
+      return Object.fromEntries(list.map((m) => [String(m.id), runtimeModel(m)]));
     },
   },
 });
@@ -898,5 +946,6 @@ export default { id: PROVIDER, server: CodarAuthPlugin };
 export const _internal = {
   PROVIDER, BASE, AUTH, V1, FREE_MODELS, MODEL_TABLE,
   call, jwtPayload, usernameOf, keyOf, configModel, runtimeModel, npmOf,
+  isNonChatModel, inferredEntry, mergeCatalogs,
   ensureFreeModel, leftOf, scrubRequestBody, systemTextSlots, discoverBlockedPiece, blockedMemo,
 };
