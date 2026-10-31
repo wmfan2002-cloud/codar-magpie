@@ -64,6 +64,34 @@ assert.equal(I.leftOf(3600), "1 小时 0 分");
 assert.equal(I.leftOf(90), "1 分钟");
 assert.equal(I.leftOf(0), "一会儿");
 
+// 身份句替换（上游对 system prompt 整句匹配触发 403）
+const BAD_LINE = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const scrubbed = `{"system":[{"type":"text","text":"${BAD_LINE}"}]}`;
+const fixed = `{"system":[{"type":"text","text":"You are an AI assistant working with the user toward their goals."}]}`;
+assert.equal(I.scrubRequestBody(scrubbed), fixed, "JSON 字符串里的身份句要被替换");
+assert.equal(I.scrubRequestBody(fixed), fixed, "没有命中时原样返回（同一引用/值）");
+assert.equal(I.scrubRequestBody("no match here"), "no match here");
+assert.ok(I.scrubRequestBody(`pre ${BAD_LINE} mid ${BAD_LINE} post`).split(BAD_LINE).every((p) => p !== BAD_LINE), "多次出现全部替换");
+// 部分命中不算命中：整句精确匹配是上游的判定，改一个字上游本来也不拦
+assert.equal(I.scrubRequestBody("You are a Claude agent"), "You are a Claude agent");
+// Uint8Array 路径：能解出 UTF-8 就替换并回字节
+const bytes = new TextEncoder().encode(scrubbed);
+const out = I.scrubRequestBody(bytes);
+assert.ok(out instanceof Uint8Array, "字节 body 返回字节");
+assert.equal(new TextDecoder().decode(out), fixed);
+// 非 UTF-8 字节原样放行
+const bin = new Uint8Array([0xff, 0xfe, 0x00, 0x9c]);
+assert.equal(I.scrubRequestBody(bin), bin);
+// undefined / null / 其他类型原样放行
+assert.equal(I.scrubRequestBody(undefined), undefined);
+assert.equal(I.scrubRequestBody(null), null);
+// 只替换目标句，不碰周边内容
+const surrounding = `prefix "${BAD_LINE}" suffix`;
+assert.equal(
+  I.scrubRequestBody(surrounding),
+  'prefix "You are an AI assistant working with the user toward their goals." suffix',
+);
+
 // ensureFreeModel：节流后仍返回状态（不能返回 null，否则列表会误判成「可领取」）
 const origFetch = globalThis.fetch;
 let claimCalls = 0;

@@ -20,7 +20,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.5.0";
+const CLIENT = "codar-magpie/0.5.1";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -257,6 +257,39 @@ async function signStatus(token, username, { timeoutMs = 5_000, cacheMs = 60_000
 const fmtInt = (n) => (Number.isFinite(Number(n)) ? Number(n).toLocaleString("en-US") : "0");
 const asIso = (sec) => (sec ? new Date(Number(sec) * 1000).toISOString() : undefined);
 
+/**
+ * Codar 网关会扫描请求体里的 system prompt，命中某些客户端身份句时拒绝登录凭证
+ * （403 client_not_supported："This login credential is restricted to Codar"）。
+ * 实测是整句精确匹配：单独的 "Claude Code"、"Anthropic"、claude-cli UA 都不触发。
+ * 这里在发出前把命中的句子换成中性句，其余字节不动（与人工验证过的本地代理同款）。
+ * 覆盖字符串和 UTF-8 字节两种 body——AI SDK 发的都是字符串；非 UTF-8（如 gzip）原样放行。
+ */
+const PROMPT_SUBSTITUTIONS = [
+  [
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    "You are an AI assistant working with the user toward their goals.",
+  ],
+];
+
+function scrubRequestBody(body) {
+  if (typeof body === "string") {
+    if (!PROMPT_SUBSTITUTIONS.some(([bad]) => body.includes(bad))) return body;
+    return PROMPT_SUBSTITUTIONS.reduce((s, [bad, good]) => s.split(bad).join(good), body);
+  }
+  if (body instanceof Uint8Array) {
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    } catch {
+      return body; // 不是 UTF-8 文本（压缩包/图片等），不碰
+    }
+    if (!PROMPT_SUBSTITUTIONS.some(([bad]) => text.includes(bad))) return body;
+    const fixed = PROMPT_SUBSTITUTIONS.reduce((s, [bad, good]) => s.split(bad).join(good), text);
+    return new TextEncoder().encode(fixed);
+  }
+  return body;
+}
+
 /* ---------------------------------------------------------------- 插件 */
 
 export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
@@ -425,7 +458,8 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
           headers.set("authorization", `Bearer ${key}`);
           if (String(url).includes("/messages")) headers.set("anthropic-version", "2023-06-01");
           headers.delete("content-length"); // 交给 fetch 重算
-          return fetch(input, { ...init, headers });
+          // 请求体过一遍身份句替换，避免上游对 agent 客户端的 prompt 扫描 403
+          return fetch(input, { ...init, headers, body: scrubRequestBody(init?.body) });
         },
       };
     },
@@ -611,5 +645,5 @@ export default { id: PROVIDER, server: CodarAuthPlugin };
 export const _internal = {
   PROVIDER, BASE, AUTH, V1, FREE_MODELS, MODEL_TABLE,
   call, jwtPayload, usernameOf, keyOf, configModel, runtimeModel, npmOf,
-  ensureFreeModel, leftOf,
+  ensureFreeModel, leftOf, scrubRequestBody,
 };

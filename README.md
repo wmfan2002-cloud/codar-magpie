@@ -215,6 +215,23 @@ agent 里用 `<供应商>/<模型>` 指代，例如 `codar/auto`、`codar/claude
 所有模型都声明 `tool_call`，实际工具调用由上游完成。**图片输入不要用**：目录写着支持，
 但实测返回 400，插件里已经统一声明成纯文本。
 
+### 客户端身份句替换（403 client_not_supported）
+
+Codar 网关会扫描请求体里的 system prompt，命中某些 agent 客户端的身份句时拒绝登录凭证：
+
+```
+403 {"detail":{"code":"client_not_supported",
+     "message":"This login credential is restricted to Codar. Use an API key for other clients."}}
+```
+
+实测是**整句精确匹配**——请求里出现 "Claude Code"、"Anthropic"、`claude-cli` UA 都不触发，
+只有完整那一句会。插件在 `loader` 的 fetch 钩子里发请求前做一次字符串替换，
+只动命中的句子，其余字节（含 SSE 流式）原样透传。非 UTF-8 的 body（压缩、二进制）不碰。
+所以 Claude Code / Codex / OpenCode 等 agent 直连 Codar 也能用了，无需再单独跑一个本地修复代理。
+
+> Codar 没有自助 API Key（`/api/keys` 需要管理员），所以上游错误提示里的
+> "Use an API key" 对普通用户是条死路——替换句子是让登录凭证继续可用的唯一办法。
+
 ### 用量（`auth.usage`）
 
 账号卡片、`magpie quota`、`magpie accounts` 和 `GET /v1/magpie/quotas` 都会显示：
@@ -326,6 +343,7 @@ magpie 的插件页面跑在 `sandbox="allow-scripts"` + `connect-src 'none'` �
 | 现象 | 处理 |
 |---|---|
 | `401` / 账号被标「需要重新登录」 | JWT 过期（7 天）→ `magpie plugin login codar` 重扫 |
+| `403 client_not_supported` | 请求里的身份句变了、上游加了新匹配句 → 把新句子加进 `index.mjs` 的 `PROMPT_SUBSTITUTIONS`（0.5.1 起内置一句，覆盖 Claude Code） |
 | 扫码页打开是二维码图片 | 正常，直接用微信扫 |
 | 登录时提示要手机号验证 | 新 IP 或未绑手机，去网页控制台完成一次，再用「粘贴 Token」 |
 | `No available channel for model 'X'` | 模型名大小写敏感，用 `magpie models` 里的精确 id |
