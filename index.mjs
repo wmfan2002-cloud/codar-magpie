@@ -21,7 +21,7 @@ const PROVIDER = "codar";
 const BASE = "https://api.claw.speedai.com"; // 推理 / 模型目录 / 免费模型活动
 const AUTH = "https://api.kuaipaper.com"; // 扫码登录 / 每日签到 / 点数余额
 const V1 = `${BASE}/v1`;
-const CLIENT = "codar-magpie/0.5.2";
+const CLIENT = "codar-magpie/0.5.3";
 
 /** 所有模型统一按 1M 上下文报告；实际限制以供应商报错为准。 */
 const CONTEXT_WINDOW = 1_000_000;
@@ -31,7 +31,27 @@ const CONTEXT_WINDOW = 1_000_000;
 const FREE_MODELS = new Set(["auto", "deepseek-v4.1-flash"]);
 
 /**
- * 目录快照，登录前就能选出模型。运行时会被 /v1/codar/models 覆盖。
+ * 精选目录之外、上游 /v1/models 里有且能走对话协议的模型快照。
+ * 它们没有 /v1/codar/models 的协议声明，按 id 推断：claude-* 走 Anthropic，其余走 Chat。
+ * 同时作为断网/超时时的兜底，保证模型列表不会因为一次读失败而缩水。
+ */
+const EXTRA_MODEL_IDS = [
+  "MiniMax-M2.7", "MiniMax-M3", "Qwen3.8-27B", "SpeedAI-S1-35B-A3B",
+  "Tianfu-T1", "Tianfu-T1-35B-A3B-20260811", "auto-vision",
+  "claude-fable-5", "claude-fable-5-1", "deepseek-flash",
+  "doubao-seed-2-0-code-preview-260215", "doubao-seed-2-0-lite-260428",
+  "doubao-seed-2-0-pro-260215", "doubao-seed-2-1-pro-260628",
+  "doubao-seed-2-1-pro-260915", "doubao-seed-2-1-turbo-260628",
+  "doubao-seed-evolving", "gemini-2.5-flash-nothinking", "gemini-3-flash",
+  "gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-3.1-pro",
+  "gemini-3.1-pro-preview", "gemini-3.5-flash", "gemini-4-argon", "glm-5.1",
+  "gpt-5.6-luna", "gpt-6-luna", "gpt-6.1-sol", "hy3", "kimi-k2.6",
+  "kimi-k2.7-code", "kimi-k3", "qwen3.6-plus", "qwen3.7-max", "qwen3.7-plus",
+];
+
+/**
+ * 目录快照，登录前就能选出模型。运行时用上游目录刷新；取不到时保留这份快照，
+ * 避免一次超时让 magpie 把已经勾选的模型取消掉。
  *   ctx: 上下文窗口（统一 1M）    api: anthropic | chat    reasoning: 是否回传思维链
  */
 const MODEL_TABLE = [
@@ -51,6 +71,12 @@ const MODEL_TABLE = [
   { id: "claude-opus-5-kiro", ctx: 1_000_000, api: "anthropic", reasoning: true },
   { id: "claude-opus-5-5", ctx: 1_000_000, api: "anthropic", reasoning: true },
   { id: "claude-opus-5-5-kiro", ctx: 1_000_000, api: "anthropic", reasoning: true },
+  ...EXTRA_MODEL_IDS.map((id) => ({
+    id,
+    ctx: CONTEXT_WINDOW,
+    api: /^claude/i.test(id) ? "anthropic" : "chat",
+    reasoning: /^(claude|deepseek|glm|kimi|qwen|minimax|doubao|gemini|gpt-6|gpt-5\.6)/i.test(id),
+  })),
 ];
 
 /* ------------------------------------------------------------------ 基础 */
@@ -188,23 +214,49 @@ function inferredEntry(id) {
   };
 }
 
+/** 内置快照条目转成目录条目：上游读不到时也保留协议信息。 */
+function staticEntry(m) {
+  return {
+    id: m.id,
+    display_name: m.id,
+    protocol: { type: m.api === "anthropic" ? "anthropic_messages" : "openai_chat_completions" },
+    context_window: m.ctx,
+  };
+}
+
 /**
  * 合并两份目录：
- *   curated — /v1/codar/models，带协议 / 定价 / schema，优先
- *   raw     — /v1/models，OpenAI 风格的全量清单，只补 curated 没有的对话模型
+ *   curated  — /v1/codar/models，带协议 / 定价 / schema，优先
+ *   rawIds   — /v1/models，OpenAI 风格的全量清单，只补 curated 没有的对话模型
+ *   snapshot — 内置快照，最后补漏，保证列表不会缩水
  */
-function mergeCatalogs(curated, rawIds) {
+function mergeCatalogs(curated, rawIds, snapshot = []) {
   const have = new Set(curated.map((m) => String(m.id)));
-  const extras = [];
-  const seen = new Set();
+  const out = [...curated];
+  const seen = new Set(have);
   for (const raw of rawIds) {
     const id = String(raw ?? "");
-    if (!id || have.has(id) || seen.has(id) || isNonChatModel(id)) continue;
+    if (!id || seen.has(id) || isNonChatModel(id)) continue;
     seen.add(id);
-    extras.push(inferredEntry(id));
+    out.push(inferredEntry(id));
   }
-  return [...curated, ...extras];
+  for (const m of snapshot) {
+    const id = String(m.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(m);
+  }
+  return out;
 }
+
+/** 目录条目 → magpie 需要的 { id: Model }。 */
+function toModelMap(entries) {
+  return Object.fromEntries(entries.map((m) => [String(m.id), runtimeModel(m)]));
+}
+
+/** 上一份成功的合并结果；上游偶发超时时继续用，不要缩表。 */
+let modelsCache = null; // { at, entries }
+const MODELS_CACHE_MS = 5 * 60 * 1000;
 
 /** provider.models 钩子里的模型：完整的 OpenCode Model。 */
 function runtimeModel(raw) {
@@ -910,11 +962,18 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
     async models(provider, { auth } = {}) {
       const key = keyOf(auth);
       if (!key) return provider?.models ?? {};
-      // 精选目录给协议 / 定价；全量清单补上它没列的对话模型。两份并发读，
-      // 任何一份失败都不影响另一份（精选目录失败时仍能显示全量列表）。
+      const snapshot = MODEL_TABLE.map(staticEntry);
+      // 上游目录偶尔要 10s+；宿主等不了。缓存成功结果，超时就退回快照，
+      // 否则 magpie 会以为模型「消失」并把它们取消勾选。
+      // JWT 过期时不走缓存，让下面的 401 正常触发重新登录。
+      const exp = jwtPayload(key)?.exp;
+      const expired = exp && Number(exp) * 1000 <= Date.now();
+      if (!expired && modelsCache && Date.now() - modelsCache.at < MODELS_CACHE_MS) {
+        return toModelMap(modelsCache.entries);
+      }
       const [catR, rawR] = await Promise.allSettled([
-        call(`${BASE}/v1/codar/models`, { token: key, timeoutMs: 15_000 }),
-        call(`${BASE}/v1/models`, { token: key, timeoutMs: 15_000 }),
+        call(`${BASE}/v1/codar/models`, { token: key, timeoutMs: 3_000 }),
+        call(`${BASE}/v1/models`, { token: key, timeoutMs: 3_000 }),
       ]);
       const cat = catR.status === "fulfilled" ? catR.value : null;
       const raw = rawR.status === "fulfilled" ? rawR.value : null;
@@ -924,9 +983,15 @@ export const CodarAuthPlugin = async ({ client } = {}, options = {}) => ({
       }
       const curated = (Array.isArray(cat?.data?.data) ? cat.data.data : []).filter((m) => m?.id);
       const rawIds = (Array.isArray(raw?.data?.data) ? raw.data.data : []).map((m) => m?.id);
-      const list = mergeCatalogs(curated, rawIds);
-      if (!list.length) return provider?.models ?? {};
-      return Object.fromEntries(list.map((m) => [String(m.id), runtimeModel(m)]));
+      // 只有全量清单读成功才更新缓存；精选目录单独更新不值得冒险。
+      if (rawIds.length) {
+        const entries = mergeCatalogs(curated.length ? curated : snapshot, rawIds, snapshot);
+        modelsCache = { at: Date.now(), entries };
+        return toModelMap(entries);
+      }
+      if (modelsCache) return toModelMap(modelsCache.entries);
+      // 两份都没读到时仍返回完整快照（52 个），不是只返回精选目录。
+      return toModelMap(snapshot);
     },
   },
 });
@@ -946,6 +1011,6 @@ export default { id: PROVIDER, server: CodarAuthPlugin };
 export const _internal = {
   PROVIDER, BASE, AUTH, V1, FREE_MODELS, MODEL_TABLE,
   call, jwtPayload, usernameOf, keyOf, configModel, runtimeModel, npmOf,
-  isNonChatModel, inferredEntry, mergeCatalogs,
+  isNonChatModel, inferredEntry, mergeCatalogs, staticEntry, toModelMap,
   ensureFreeModel, leftOf, scrubRequestBody, systemTextSlots, discoverBlockedPiece, blockedMemo,
 };

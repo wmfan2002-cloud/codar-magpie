@@ -54,10 +54,18 @@ assert.equal(rm2.limit.context, 1_000_000);
 const rm3 = I.runtimeModel({ id: "gpt-6-sol", protocol: "openai_chat_completions", context_window: 128_000 });
 assert.equal(rm3.limit.context, 1_000_000);
 
-// 目录里的每个 id 都在静态表里（两边不漂移）
+// 目录快照：精选 16 + 全量清单里的 36 个对话模型
 const ids = new Set(I.MODEL_TABLE.map((m) => m.id));
-assert.equal(ids.size, 16);
+assert.equal(ids.size, 52);
 for (const id of ["auto", "claude-opus-5-5", "glm-5.3-flash", "gpt-6-sol"]) assert.ok(ids.has(id), id);
+for (const id of ["kimi-k3", "qwen3.7-max", "claude-fable-5-1", "gemini-3.1-pro"]) assert.ok(ids.has(id), id);
+assert.equal(I.MODEL_TABLE.find((m) => m.id === "claude-fable-5-1").api, "anthropic");
+assert.equal(I.MODEL_TABLE.find((m) => m.id === "kimi-k3").api, "chat");
+// 快照兜底：raw 清单缺失时，内置模型一个都不能少
+const snap = I.MODEL_TABLE.map(I.staticEntry);
+const fallback = I.mergeCatalogs([], [], snap);
+assert.equal(fallback.length, 52);
+assert.equal(I.toModelMap(fallback)["claude-fable-5-1"].api.npm, "@ai-sdk/anthropic");
 
 // 全量清单合并：精选目录优先，补上它没列的对话模型，排除画图/向量模型
 assert.equal(I.isNonChatModel("gpt-image-2"), true);
@@ -68,8 +76,9 @@ assert.equal(I.isNonChatModel("claude-fable-5-1"), false);
 const merged = I.mergeCatalogs(
   [{ id: "auto", protocol: "openai_chat_completions" }],
   ["auto", "kimi-k3", "gpt-image-2", "kimi-k3", "claude-fable-5-1", ""],
+  [{ id: "glm-5.1" }, { id: "kimi-k3" }],
 );
-assert.deepEqual(merged.map((m) => m.id), ["auto", "kimi-k3", "claude-fable-5-1"]);
+assert.deepEqual(merged.map((m) => m.id), ["auto", "kimi-k3", "claude-fable-5-1", "glm-5.1"]);
 assert.equal(I.runtimeModel(I.inferredEntry("claude-fable-5-1")).api.npm, "@ai-sdk/anthropic");
 assert.equal(I.runtimeModel(I.inferredEntry("kimi-k3")).api.npm, "@ai-sdk/openai-compatible");
 

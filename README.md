@@ -203,7 +203,11 @@ agent 里用 `<供应商>/<模型>` 指代，例如 `codar/auto`、`codar/claude
   画图 / 向量 / 音频类（`*-image*`、`nano-banana`、`embedding` 等）会被排除
 
 合并后约 52 个。精选目录里的模型按 `protocol` 字段分流；补充进来的 `claude-*` 走
-Anthropic Messages，其余走 OpenAI 兼容的 Chat Completions。常用模型：
+Anthropic Messages，其余走 OpenAI 兼容的 Chat Completions。
+
+上游目录偶尔会慢到 10s 以上；插件成功读到后会缓存 5 分钟，超时则沿用上次结果，
+最坏退回内置的 52 模型快照。**列表不会因为一次读失败而缩水**（否则 magpie 会把
+「消失」的模型取消勾选）。常用模型：
 
 | 模型 | API | 备注 |
 |---|---|---|
